@@ -15,7 +15,6 @@ import (
 	"time"
 	"github.com/nezhahq/service"
 	ping "github.com/prometheus-community/pro-bing"
-	"github.com/quic-go/quic-go/http3"
 	utls "github.com/refraction-networking/utls"
 	"github.com/shirou/gopsutil/v4/host"
 	"github.com/urfave/cli/v2"
@@ -57,13 +56,6 @@ var (
 		},
 		Timeout: time.Second * 30,
 	}
-	httpClient3 = &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-		Timeout:   time.Second * 30,
-		Transport: &http3.RoundTripper{},
-	}
 
 	reloadSigChan = make(chan struct{})
 )
@@ -94,11 +86,10 @@ func setEnv() {
 		if len(agentConfig.DNS) > 0 {
 			dnsServers = agentConfig.DNS
 		}
-		index := int(time.Now().Unix()) % int(len(dnsServers))
 		var conn net.Conn
 		var err error
-		for i := 0; i < len(dnsServers); i++ {
-			conn, err = d.DialContext(ctx, "udp", dnsServers[util.RotateQueue1(index, i, len(dnsServers))])
+		for _, server := range util.RangeRnd(dnsServers) {
+			conn, err = d.DialContext(ctx, "udp", server)
 			if err == nil {
 				return conn, nil
 			}
@@ -109,7 +100,7 @@ func setEnv() {
 	http.DefaultClient.Timeout = time.Second * 30
 	httpClient.Transport = utlsx.NewUTLSHTTPRoundTripperWithProxy(
 		utls.HelloChrome_Auto, new(utls.Config),
-		http.DefaultTransport, nil, &headers,
+		http.DefaultTransport, nil, headers,
 	)
 }
 
@@ -598,16 +589,14 @@ func lookupIP(hostOrIp string) (string, error) {
 }
 
 func ioStreamKeepAlive(ctx context.Context, stream pb.NezhaService_IOStreamClient) {
-	// Can be replaced with time.Tick after upgrading to Go 1.23+
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+	ticker := time.Tick(30 * time.Second)
 
 	for {
 		select {
 		case <-ctx.Done():
 			printf("IOStream KeepAlive stopped: %v", ctx.Err())
 			return
-		case <-ticker.C:
+		case <-ticker:
 			if err := stream.Send(&pb.IOStreamData{Data: []byte{}}); err != nil {
 				printf("IOStream KeepAlive failed: %v", err)
 				return

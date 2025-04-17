@@ -6,14 +6,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
+	"github.com/go-viper/mapstructure/v2"
 	"github.com/hashicorp/go-uuid"
 	"github.com/knadh/koanf/providers/env"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
 	"sigs.k8s.io/yaml"
-
-	"github.com/nezhahq/agent/pkg/util"
 )
 
 //go:generate go run gen/gen.go -type=AgentConfig
@@ -45,7 +45,7 @@ type AgentConfig struct {
 func (c *AgentConfig) Read(path string) error {
 	c.k = koanf.New("")
 	c.filePath = path
-	saveOnce := util.OnceValue(c.Save)
+	saveOnce := sync.OnceValue(c.Save)
 
 	if _, err := os.Stat(path); err == nil {
 		err = c.k.Load(file.Provider(path), new(kubeyaml))
@@ -71,7 +71,7 @@ func (c *AgentConfig) Read(path string) error {
 	if c.UUID == "" {
 		if uuid, err := uuid.GenerateUUID(); err == nil {
 			c.UUID = uuid
-			saveOnce()
+			defer saveOnce()
 		} else {
 			return fmt.Errorf("generate UUID failed: %v", err)
 		}
@@ -92,6 +92,17 @@ func (c *AgentConfig) Save() error {
 	}
 
 	return os.WriteFile(c.filePath, data, 0600)
+}
+
+func (c *AgentConfig) MapDecoder() (*mapstructure.Decoder, error) {
+	cfg := &mapstructure.DecoderConfig{
+		Metadata:         nil,
+		Result:           c,
+		WeaklyTypedInput: true,
+		TagName:          "json",
+	}
+
+	return mapstructure.NewDecoder(cfg)
 }
 
 func ValidateConfig(c *AgentConfig, isRemoteEdit bool) error {
