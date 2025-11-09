@@ -8,12 +8,10 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sync/atomic"
 	"time"
-	"github.com/nezhahq/service"
 	ping "github.com/prometheus-community/pro-bing"
 	utls "github.com/refraction-networking/utls"
 	"github.com/shirou/gopsutil/v4/host"
@@ -23,7 +21,6 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/resolver"
 
-	"github.com/nezhahq/agent/cmd/agent/commands"
 	"github.com/nezhahq/agent/model"
 	"github.com/nezhahq/agent/pkg/logger"
 	"github.com/nezhahq/agent/pkg/monitor"
@@ -167,46 +164,8 @@ func main() {
 					return err
 				}
 			}
-			runService("", "")
+			run()
 			return nil
-		},
-		Commands: []*cli.Command{
-			{
-				Name:  "edit",
-				Usage: "编辑配置文件",
-				Flags: []cli.Flag{
-					&cli.StringFlag{Name: "config", Aliases: []string{"c"}, Usage: "配置文件路径"},
-				},
-				Action: func(c *cli.Context) error {
-					if path := c.String("config"); path != "" {
-						commands.EditAgentConfig(path, &agentConfig)
-					} else {
-						commands.EditAgentConfig(defaultConfigPath, &agentConfig)
-					}
-					return nil
-				},
-			},
-			{
-				Name:      "service",
-				Usage:     "服务操作",
-				UsageText: "<install/uninstall/start/stop/restart>",
-				Flags: []cli.Flag{
-					&cli.StringFlag{Name: "config", Aliases: []string{"c"}, Usage: "配置文件路径"},
-				},
-				Action: func(c *cli.Context) error {
-					if arg := c.Args().Get(0); arg != "" {
-						if path := c.String("config"); path != "" {
-							ap, _ := filepath.Abs(path)
-							runService(arg, ap)
-						} else {
-							ap, _ := filepath.Abs(defaultConfigPath)
-							runService(arg, ap)
-						}
-						return nil
-					}
-					return cli.Exit("必须指定一个参数", 1)
-				},
-			},
 		},
 	}
 
@@ -302,69 +261,6 @@ func run() {
 		}
 
 		retry()
-	}
-}
-
-func runService(action string, path string) {
-	winConfig := map[string]interface{}{
-		"OnFailure": "restart",
-	}
-
-	args := []string{"-c", path}
-	name := filepath.Base(executablePath)
-	if path != defaultConfigPath && path != "" {
-		hex := util.MD5Sum(path)[:7]
-		name = fmt.Sprintf("%s-%s", name, hex)
-	}
-
-	svcConfig := &service.Config{
-		Name:             name,
-		DisplayName:      filepath.Base(executablePath),
-		Arguments:        args,
-		Description:      "哪吒监控 Agent",
-		WorkingDirectory: filepath.Dir(executablePath),
-		Option:           winConfig,
-	}
-
-	prg := &commands.Program{
-		Exit: make(chan struct{}),
-		Run:  run,
-	}
-	s, err := service.New(prg, svcConfig)
-	if err != nil {
-		printf("创建服务时出错，以普通模式运行: %v", err)
-		run()
-		return
-	}
-	prg.Service = s
-
-	serviceLogger, err := logger.NewNezhaServiceLogger(s, nil)
-	if err != nil {
-		printf("获取 service logger 时出错: %+v", err)
-		logger.InitDefaultLogger(agentConfig.Debug, service.ConsoleLogger)
-	} else {
-		logger.InitDefaultLogger(agentConfig.Debug, serviceLogger)
-	}
-
-	if action == "install" {
-		initName := s.Platform()
-		if err := agentConfig.Read(path); err != nil {
-			log.Fatalf("init config failed: %v", err)
-		}
-		printf("Init system is: %s", initName)
-	}
-
-	if len(action) != 0 {
-		err := service.Control(s, action)
-		if err != nil {
-			log.Fatal(err)
-		}
-		return
-	}
-
-	err = s.Run()
-	if err != nil {
-		logger.Error(err)
 	}
 }
 
