@@ -2,13 +2,13 @@ package main
 
 import (
 	"context"
-	"crypto/md5"
 	"crypto/tls"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sync/atomic"
@@ -69,8 +69,8 @@ const (
 	delayWhenError = time.Second * 10 // Agent 重连间隔
 	networkTimeOut = time.Second * 5  // 普通网络超时
 
-	minUpdateInterval = 30
-	maxUpdateInterval = 90
+	minUpdateInterval = 1440
+	maxUpdateInterval = 2880
 
 	binaryName = "nezha-agent"
 )
@@ -313,7 +313,7 @@ func runService(action string, path string) {
 	args := []string{"-c", path}
 	name := filepath.Base(executablePath)
 	if path != defaultConfigPath && path != "" {
-		hex := fmt.Sprintf("%x", md5.Sum([]byte(path)))[:7]
+		hex := util.MD5Sum(path)[:7]
 		name = fmt.Sprintf("%s-%s", name, hex)
 	}
 
@@ -338,7 +338,7 @@ func runService(action string, path string) {
 	}
 	prg.Service = s
 
-	serviceLogger, err := s.Logger(nil)
+	serviceLogger, err := logger.NewNezhaServiceLogger(s, nil)
 	if err != nil {
 		printf("获取 service logger 时出错: %+v", err)
 		logger.InitDefaultLogger(agentConfig.Debug, service.ConsoleLogger)
@@ -586,23 +586,6 @@ func lookupIP(hostOrIp string) (string, error) {
 		return ips[0].IP.String(), nil
 	}
 	return hostOrIp, nil
-}
-
-func ioStreamKeepAlive(ctx context.Context, stream pb.NezhaService_IOStreamClient) {
-	ticker := time.Tick(30 * time.Second)
-
-	for {
-		select {
-		case <-ctx.Done():
-			printf("IOStream KeepAlive stopped: %v", ctx.Err())
-			return
-		case <-ticker:
-			if err := stream.Send(&pb.IOStreamData{Data: []byte{}}); err != nil {
-				printf("IOStream KeepAlive failed: %v", err)
-				return
-			}
-		}
-	}
 }
 
 func doWithTimeout[T any](fn func() (T, error), timeout time.Duration) (T, error) {
