@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 	ping "github.com/prometheus-community/pro-bing"
@@ -42,9 +43,29 @@ var (
 	lastReportHostInfo    time.Time
 	lastReportIPInfo      time.Time
 
-	hostStatus   atomic.Bool
-	ipStatus     atomic.Bool
-	reloadStatus atomic.Bool
+	hostStatus atomic.Bool
+	ipStatus   atomic.Bool
+
+	// reloadMu guards reloadTimer. A non-nil reloadTimer means a delayed swap
+	// to a new agentConfig is queued. A second ApplyConfig task may arrive
+	// before the timer fires (e.g. the dashboard pushing a counter-task after
+	// the operator cancels a server transfer); we Stop() the previous timer
+	// and replace it so the most recent config wins instead of the agent
+	// committing a swap the dashboard already rolled back.
+	reloadMu         sync.Mutex
+	reloadTimer      *time.Timer
+	reloadIsTransfer bool
+
+	// liveCredentials holds an atomic snapshot of (ClientSecret, ClientUUID)
+	// that the gRPC AuthHandler closure reads on every dial. We can't have the
+	// closure read agentConfig.ClientSecret directly: applyPendingReload swaps
+	// agentConfig with `agentConfig = cfg` (a multi-field struct assignment),
+	// strings are two-word headers (pointer + length), and concurrent
+	// GetRequestMetadata calls from inflight gRPC ops would observe torn reads
+	// — at best the dashboard rejects the auth, at worst a torn string header
+	// dereferences foreign memory. Publishing through atomic.Pointer gives the
+	// auth path a coherent (secret, uuid) pair without taking a lock per call.
+	liveCredentials atomic.Pointer[agentCredentials]
 
 	dnsResolver = &net.Resolver{PreferGo: true}
 	httpClient  = &http.Client{
@@ -71,6 +92,39 @@ const (
 
 	binaryName = "nezha-agent"
 )
+
+// agentCredentials is the atomic-snapshot type behind liveCredentials. We keep
+// it deliberately narrow — only the fields the gRPC AuthHandler reads — so
+// the rest of agentConfig (DNS, ReportDelay, debug toggles, ...) can keep
+// being read directly. Auth is the path where torn reads turn into
+// connection-level rejections or panics; other paths only see eventual
+// consistency.
+type agentCredentials struct {
+	ClientSecret string
+	ClientUUID   string
+}
+
+// publishCredentials atomically snapshots the credentials so concurrent
+// AuthHandler reads observe a coherent (secret, uuid) pair. Call this at
+// startup right after agentConfig.Read populates the on-disk values, and on
+// every applyPendingReload right before the in-process swap.
+func publishCredentials(cfg model.AgentConfig) {
+	liveCredentials.Store(&agentCredentials{
+		ClientSecret: cfg.ClientSecret,
+		ClientUUID:   cfg.UUID,
+	})
+}
+
+// loadCredentials returns the latest published snapshot, or a zero value if
+// publishCredentials hasn't been called yet. The AuthHandler closure uses
+// the zero fallback rather than a nil panic so an early reconnect during
+// startup degrades to "unauthenticated" instead of crashing the agent.
+func loadCredentials() agentCredentials {
+	if c := liveCredentials.Load(); c != nil {
+		return *c
+	}
+	return agentCredentials{}
+}
 
 func setEnv() {
 	resolver.SetDefaultScheme("passthrough")
@@ -175,9 +229,22 @@ func main() {
 }
 
 func run() {
+	// 把启动时 agentConfig 里的 credential 发布到 atomic 快照里 — 后续 reload
+	// 也会重新 publish，AuthHandler 闭包只读这个快照而不再裸读 agentConfig。
+	// 这是 applyPendingReload 与 gRPC 鉴权路径的并发协议起点。
+	publishCredentials(agentConfig)
+
+	// Read credentials at call time so a mid-session secret rotation (server
+	// transfer) flows into the next reconnect without rebuilding AuthHandler.
+	// 注意：闭包必须读 liveCredentials 快照，不能裸读 agentConfig.ClientSecret
+	// — 后者会与 applyPendingReload 的 `agentConfig = cfg` 结构体赋值形成
+	// data race（string 是两个 word，整体写不是原子的），TestAuthCredentialPublishConcurrentWithReadIsRaceFree
+	// 在 -race 下钉死该不变量。
 	auth := model.AuthHandler{
-		ClientSecret: agentConfig.ClientSecret,
-		ClientUUID:   agentConfig.UUID,
+		Credentials: func() (string, string) {
+			c := loadCredentials()
+			return c.ClientSecret, c.ClientUUID
+		},
 	}
 
 	var err error
@@ -276,20 +343,41 @@ func receiveTasksDaemon(tasks pb.NezhaService_RequestTaskClient, cancel context.
 			cancel()
 			return
 		}
-		go func(t *pb.Task) {
-			defer func() {
-				if err := recover(); err != nil {
-					println("task panic", task, err)
-				}
-			}()
-			result := doTask(t)
-			if result != nil {
-				if err := tasks.Send(result); err != nil {
-					printf("send task result exit: %v", err)
-					cancel()
-				}
-			}
-		}(task)
+		dispatchAgentTask(task, tasks.Send, cancel)
+	}
+}
+
+// dispatchAgentTask 决定 task 的执行调度：
+//   - TaskTypeApplyConfig / TaskTypeServerTransferApply 必须在 receive 循环
+//     里同步处理 — dashboard 的取消流程依赖「最后到达的 ApplyConfig 在 10s
+//     重载窗口内 supersede 上一条」，原先对所有 task 一律 `go func(t)` 会让
+//     两个 goroutine 抢 reloadMu 的顺序与到达顺序无关，反向调度时 agent 会
+//     把已取消的 credential 写盘锁死自己。两个 handler 都很短（JSON 解析 +
+//     ValidateConfig + 装计时器），不会拖慢其它任务接收。
+//   - 其它 task（HTTPGet/Ping/Command/Terminal/NAT/FM/...）继续 goroutine 派
+//     发：它们可能跑很久或永远不返回（流式 terminal/fm），不能阻塞接收循环。
+func dispatchAgentTask(task *pb.Task, send func(*pb.TaskResult) error, cancel context.CancelFunc) {
+	switch task.GetType() {
+	case model.TaskTypeApplyConfig, model.TaskTypeServerTransferApply:
+		runAgentTask(task, send, cancel)
+		return
+	}
+	go runAgentTask(task, send, cancel)
+}
+
+func runAgentTask(task *pb.Task, send func(*pb.TaskResult) error, cancel context.CancelFunc) {
+	defer func() {
+		if err := recover(); err != nil {
+			println("task panic", task, err)
+		}
+	}()
+	result := doTask(task)
+	if result == nil {
+		return
+	}
+	if err := send(result); err != nil {
+		printf("send task result exit: %v", err)
+		cancel()
 	}
 }
 
