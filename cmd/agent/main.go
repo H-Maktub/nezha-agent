@@ -331,9 +331,24 @@ func run() {
 	}
 }
 
+
+// newSerialTaskResultSender wraps the RequestTask stream's Send with a mutex.
+// dispatchAgentTask runs most tasks in their own goroutine, and they all share
+// one stream; gRPC Go forbids concurrent SendMsg, so every result must funnel
+// through this serializer or overlapping MCP results corrupt the stream.
+func newSerialTaskResultSender(send func(*pb.TaskResult) error) func(*pb.TaskResult) error {
+	var mu sync.Mutex
+	return func(r *pb.TaskResult) error {
+		mu.Lock()
+		defer mu.Unlock()
+		return send(r)
+	}
+}
+
 func receiveTasksDaemon(tasks pb.NezhaService_RequestTaskClient, cancel context.CancelFunc) {
 	var task *pb.Task
 	var err error
+	send := newSerialTaskResultSender(tasks.Send)
 	for {
 		task, err = doWithTimeout(func() (*pb.Task, error) {
 			return tasks.Recv()
@@ -343,7 +358,7 @@ func receiveTasksDaemon(tasks pb.NezhaService_RequestTaskClient, cancel context.
 			cancel()
 			return
 		}
-		dispatchAgentTask(task, tasks.Send, cancel)
+		dispatchAgentTask(task, send, cancel)
 	}
 }
 
@@ -402,10 +417,7 @@ func doTask(task *pb.Task) *pb.TaskResult {
 func reportStateDaemon(stateClient pb.NezhaService_ReportSystemStateClient, cancel context.CancelFunc) {
 	var err error
 	for {
-		_, err = doWithTimeout(func() (*int, error) {
-			lastReportHostInfo, lastReportIPInfo, err = reportState(stateClient, lastReportHostInfo, lastReportIPInfo)
-			return nil, err
-		}, time.Second*10)
+		lastReportHostInfo, lastReportIPInfo, err = reportState(stateClient, lastReportHostInfo, lastReportIPInfo)
 		if err != nil {
 			printf("reportStateDaemon exit: %v", err)
 			cancel()
@@ -421,10 +433,12 @@ func reportState(statClient pb.NezhaService_ReportSystemStateClient, host, ip ti
 	}
 	if initialized {
 		monitor.TrackNetworkSpeed()
-		if err := statClient.Send(monitor.GetState(agentConfig.SkipConnectionCount, agentConfig.SkipProcsCount).PB()); err != nil {
+		if _, err := doWithTimeout(func() (*pb.Receipt, error) {
+			return nil, statClient.Send(monitor.GetState(agentConfig.SkipConnectionCount, agentConfig.SkipProcsCount).PB())
+		}, time.Second*10); err != nil {
 			return host, ip, err
 		}
-		_, err := statClient.Recv()
+		_, err := doWithTimeout(statClient.Recv, time.Second*10)
 		if err != nil {
 			return host, ip, err
 		}
@@ -451,7 +465,9 @@ func reportHost() bool {
 	}
 	defer hostStatus.Store(false)
 	if client != nil && initialized {
-		receipt, err := client.ReportSystemInfo2(context.Background(), monitor.GetHost().PB())
+		receipt, err := doWithTimeout(func() (*pb.Uint64Receipt, error) {
+			return client.ReportSystemInfo2(context.Background(), monitor.GetHost().PB())
+		}, time.Second*10)
 		if err != nil {
 			printf("ReportSystemInfo2 error: %v", err)
 			return false
@@ -480,7 +496,9 @@ func reportGeoIP(use6, forceUpdate bool) bool {
 		return true
 	}
 
-	geoip, err := client.ReportGeoIP(context.Background(), pbg)
+	geoip, err := doWithTimeout(func() (*pb.GeoIP, error) {
+		return client.ReportGeoIP(context.Background(), pbg)
+	}, time.Second*10)
 	if err != nil {
 		return false
 	}
